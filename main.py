@@ -88,7 +88,7 @@ async def chat_completions(request: Request):
     
     # 🌟 최신 claude-sonnet-5.5 모델 적용
     payload = {
-        "model": "claude-sonnet-5.5",
+        "model": "claude-sonnet-5-5",
         "messages": anthropic_messages,
         "max_tokens": 8192
     }
