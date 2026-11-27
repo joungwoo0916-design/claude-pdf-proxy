@@ -1,9 +1,10 @@
 import base64
 import json
 import os
+import time
 import fitz  # PyMuPDF
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 
 app = FastAPI()
@@ -31,6 +32,7 @@ def convert_pdf_base64_to_images(b64_str):
 async def chat_completions(request: Request):
     data = await request.json()
     messages = data.get("messages", [])
+    stream = data.get("stream", True)
     
     anthropic_messages = []
     system_prompt = ""
@@ -74,12 +76,11 @@ async def chat_completions(request: Request):
                         })
         anthropic_messages.append({"role": "user" if role == "user" else "assistant", "content": anthropic_content})
     
-    # 🌟 클로드 본사 공식 정식 모델명 지정
     payload = {
         "model": "claude-3-5-sonnet-20241022",
         "messages": anthropic_messages,
         "max_tokens": 8192,
-        "stream": True
+        "stream": stream
     }
     if system_prompt:
         payload["system"] = system_prompt
@@ -90,56 +91,71 @@ async def chat_completions(request: Request):
         "content-type": "application/json"
     }
 
-    async def stream_generator():
-        # 1. API 키 누락 체크
-        if not ANTHROPIC_API_KEY:
-            error_msg = "⚠️ [프록시 오류] Railway의 claude-pdf-proxy 서비스에 ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다!"
-            chunk = {"id": "err", "object": "chat.completion.chunk", "choices": [{"delta": {"role": "assistant", "content": error_msg}, "index": 0}]}
-            yield f"data: {json.dumps(chunk)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+    created_time = int(time.time())
 
-        async with http_client.stream("POST", "https://api.anthropic.com/v1/messages", json=payload, headers=headers) as resp:
-            # 2. 클로드 본사 응답이 에러인 경우 화면에 즉시 출력
-            if resp.status_code != 200:
-                err_text = await resp.aread()
-                print(f"[Anthropic API Error] {resp.status_code}: {err_text.decode('utf-8')}")
-                error_msg = f"⚠️ [클로드 본사 API 거절 - 코드 {resp.status_code}]: {err_text.decode('utf-8')}"
-                chunk = {"id": "err", "object": "chat.completion.chunk", "choices": [{"delta": {"role": "assistant", "content": error_msg}, "index": 0}]}
-                yield f"data: {json.dumps(chunk)}\n\n"
+    # 1. 스트리밍 모드 처리
+    if stream:
+        async def stream_generator():
+            async with http_client.stream("POST", "https://api.anthropic.com/v1/messages", json=payload, headers=headers) as resp:
+                if resp.status_code != 200:
+                    err_text = await resp.aread()
+                    error_msg = f"⚠️ [클로드 API 오류 {resp.status_code}]: {err_text.decode('utf-8')}"
+                    chunk = {"id": "err", "object": "chat.completion.chunk", "created": created_time, "model": "claude-sonnet-5", "choices": [{"index": 0, "delta": {"role": "assistant", "content": error_msg}, "finish_reason": "stop"}]}
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                # 첫 번째 청크: role 전달
+                first_chunk = {"id": "chatcmpl-proxy", "object": "chat.completion.chunk", "created": created_time, "model": "claude-sonnet-5", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
+                yield f"data: {json.dumps(first_chunk)}\n\n"
+
+                async for line in resp.aiter_lines():
+                    if line.startswith("data: "):
+                        raw_data = line[6:].strip()
+                        try:
+                            event = json.loads(raw_data)
+                            if event.get("type") == "content_block_delta":
+                                chunk_text = event.get("delta", {}).get("text", "")
+                                if chunk_text:
+                                    chunk = {
+                                        "id": "chatcmpl-proxy",
+                                        "object": "chat.completion.chunk",
+                                        "created": created_time,
+                                        "model": "claude-sonnet-5",
+                                        "choices": [{"index": 0, "delta": {"content": chunk_text}, "finish_reason": None}]
+                                    }
+                                    yield f"data: {json.dumps(chunk)}\n\n"
+                        except:
+                            continue
+                
+                # 종료 청크
+                stop_chunk = {"id": "chatcmpl-proxy", "object": "chat.completion.chunk", "created": created_time, "model": "claude-sonnet-5", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(stop_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
-                return
 
-            # 3. 정상 스트리밍 전달
-            async for line in resp.aiter_lines():
-                if line.startswith("data: "):
-                    raw_data = line[6:].strip()
-                    if raw_data == "[DONE]":
-                        yield "data: [DONE]\n\n"
-                        break
-                    try:
-                        event = json.loads(raw_data)
-                        if event.get("type") == "content_block_delta":
-                            chunk_text = event.get("delta", {}).get("text", "")
-                            if chunk_text:
-                                chunk = {
-                                    "id": "chatcmpl-proxy",
-                                    "object": "chat.completion.chunk",
-                                    "choices": [{"delta": {"role": "assistant", "content": chunk_text}, "index": 0}]
-                                }
-                                yield f"data: {json.dumps(chunk)}\n\n"
-                    except:
-                        continue
-        yield "data: [DONE]\n\n"
+        response_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+        return StreamingResponse(stream_generator(), headers=response_headers, media_type="text/event-stream")
 
-    response_headers = {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no"
-    }
-
-    return StreamingResponse(stream_generator(), headers=response_headers, media_type="text/event-stream")
+    # 2. 일반(Non-stream) 모드 처리
+    else:
+        resp = await http_client.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers)
+        res_data = resp.json()
+        full_text = ""
+        for part in res_data.get("content", []):
+            if part.get("type") == "text":
+                full_text += part.get("text", "")
+        return JSONResponse({
+            "id": "chatcmpl-proxy",
+            "object": "chat.completion",
+            "created": created_time,
+            "model": "claude-sonnet-5",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": full_text}, "finish_reason": "stop"}]
+        })
 
 @app.post("/v1/responses")
 @app.post("/responses")
