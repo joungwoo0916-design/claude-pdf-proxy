@@ -1,52 +1,179 @@
-version: 1.2.1
-cache: true
+import base64
+import json
+import os
+import time
+import asyncio
+import fitz  # PyMuPDF
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+import httpx
 
-fileConfig:
-  serverFileSizeLimit: 50
-  legacyFileUploadUX: false
-  endpoints:
-    default:
-      fileLimit: 10
-      fileSizeLimit: 50
-      totalSizeLimit: 100
-      supportedMimeTypes:
-        - "application/pdf"
-        - "text/.*"
-        - "application/vnd.openxmlformats-officedocument.*"
-        - "application/vnd.ms-excel"
-        - "image/.*"
+app = FastAPI()
 
-endpoints:
-  custom:
-    - name: "Claude-Enterprise"
-      apiKey: "dummy-key"
-      baseURL: "https://[내_프록시_주소]/v1"  # 본인 프록시 주소
-      models:
-        default: ["claude-sonnet-5.5"]
-      titleConvo: true
-      titleModel: "claude-sonnet-5.5"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+http_client = httpx.AsyncClient(timeout=120.0)
 
-modelSpecs:
-  enforce: true
-  prioritize: true
-  list:
-    - name: "claude-sonnet-5.5"
-      label: "Claude Sonnet 5.5 (사내 표준 / 도면 자동분석)"
-      default: true
-      artifacts: true
-      preset:
-        endpoint: "Claude-Enterprise"
-        model: "claude-sonnet-5.5"
-        promptPrefix: |
-          [시스템 절대 원칙: 전사 오피스, 도면 분석 및 시각화 자동화 지침]
-          당신은 엔지니어링 도면 분석, 기업용 프레젠테이션, 엑셀 데이터 제작 최고 전문가입니다.
-          1. 첨부된 도면 이미지에서 표제란(도번, 품명, 재질, 승인일자), 부품 목록(BOM), 주요 치수, 주기사항을 표(Table)로 도출하십시오.
-          2. PPT 제작 요청 시 :::artifact{identifier="office-deck" type="text/html" title="결과물 미리보기"} 태그 및 PptxGenJS CDN 연동 다운로드 버튼을 만드십시오.
-          3. 엑셀 정리 요청 시 SheetJS CDN 연동 및 [⬇ 엑셀(.xlsx) 다운로드] 버튼을 만드십시오.
+def convert_pdf_base64_to_images(b64_str):
+    try:
+        pdf_bytes = base64.b64decode(b64_str)
+        if not pdf_bytes.startswith(b"%PDF"):
+            return None
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        images = []
+        for page in doc:
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.3, 1.3))
+            img_b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+            images.append(img_b64)
+        return images
+    except Exception as e:
+        print(f"[Error] PDF convert failed: {e}", flush=True)
+        return None
 
-    - name: "gemini-3.5-flash-lite"
-      label: "Gemini 3.5 Flash (대용량/초고속 전용)"
-      artifacts: true
-      preset:
-        endpoint: "google"
-        model: "gemini-3.5-flash-lite"
+@app.post("/v1/chat/completions")
+@app.post("/chat/completions")
+@app.post("/v1/v1/chat/completions")
+async def chat_completions(request: Request):
+    data = await request.json()
+    messages = data.get("messages", [])
+    stream = data.get("stream", True)
+    
+    anthropic_messages = []
+    system_prompt = ""
+    first_user_text = "새로운 대화"
+    
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        
+        if role == "system":
+            system_prompt = content
+            continue
+            
+        anthropic_content = []
+        if isinstance(content, str):
+            anthropic_content.append({"type": "text", "text": content})
+            if role == "user" and first_user_text == "새로운 대화":
+                first_user_text = content[:20]
+        elif isinstance(content, list):
+            for part in content:
+                p_type = part.get("type")
+                if p_type == "text":
+                    t_val = part.get("text", "")
+                    anthropic_content.append({"type": "text", "text": t_val})
+                    if role == "user" and first_user_text == "새로운 대화":
+                        first_user_text = t_val[:20]
+                elif p_type in ["image_url", "image"]:
+                    url = part.get("image_url", {}).get("url", "") or part.get("url", "")
+                    if "base64," in url:
+                        header, b64_data = url.split("base64,", 1)
+                        if "application/pdf" in header or b64_data.startswith("JVBERi"):
+                            print("[Magic Hook] 도면 PDF 감지 -> 고화질 이미지 변환 실행!", flush=True)
+                            captured_images = convert_pdf_base64_to_images(b64_data)
+                            if captured_images:
+                                for img_b64 in captured_images:
+                                    anthropic_content.append({
+                                        "type": "image",
+                                        "source": {"type": "base64", "media_type": "image/png", "data": img_b64}
+                                    })
+                                continue
+                        
+                        media_type = "image/png"
+                        if "jpeg" in header or "jpg" in header: media_type = "image/jpeg"
+                        elif "webp" in header: media_type = "image/webp"
+                        anthropic_content.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media_type, "data": b64_data}
+                        })
+        anthropic_messages.append({"role": "user" if role == "user" else "assistant", "content": anthropic_content})
+    
+    # 🌟 최신 claude-sonnet-5.5 모델 적용
+    payload = {
+        "model": "claude-sonnet-5.5",
+        "messages": anthropic_messages,
+        "max_tokens": 8192
+    }
+    if system_prompt:
+        payload["system"] = system_prompt
+
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+
+    created_time = int(time.time())
+
+    try:
+        resp = await http_client.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers)
+        if resp.status_code != 200:
+            err_body = resp.text
+            print(f"[Anthropic Error] {resp.status_code}: {err_body}", flush=True)
+            full_text = f"⚠️ [클로드 API 거절 {resp.status_code}]: {err_body}"
+        else:
+            res_data = resp.json()
+            full_text = ""
+            for part in res_data.get("content", []):
+                if part.get("type") == "text":
+                    full_text += part.get("text", "")
+            print(f"[Success] Claude Sonnet 5.5 답변 생성 완료 ({len(full_text)}자)", flush=True)
+    except Exception as e:
+        print(f"[Exception] {e}", flush=True)
+        full_text = f"⚠️ [프록시 오류]: {str(e)}"
+
+    if stream:
+        async def stream_generator():
+            start_chunk = {
+                "id": "chatcmpl-proxy",
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": "claude-sonnet-5.5",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
+            }
+            yield f"data: {json.dumps(start_chunk)}\n\n"
+
+            chunk_size = 8
+            for i in range(0, len(full_text), chunk_size):
+                piece = full_text[i:i+chunk_size]
+                chunk = {
+                    "id": "chatcmpl-proxy",
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": "claude-sonnet-5.5",
+                    "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+                await asyncio.sleep(0.01)
+
+            stop_chunk = {
+                "id": "chatcmpl-proxy",
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": "claude-sonnet-5.5",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            }
+            yield f"data: {json.dumps(stop_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        response_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+        return StreamingResponse(stream_generator(), headers=response_headers, media_type="text/event-stream")
+
+    else:
+        # 비스트리밍(대화 제목 생성) 응답
+        if not full_text.strip():
+            full_text = first_user_text.replace("\n", " ").strip()[:20]
+        return JSONResponse({
+            "id": "chatcmpl-proxy",
+            "object": "chat.completion",
+            "created": created_time,
+            "model": "claude-sonnet-5.5",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": full_text.strip().replace('"', '')}, "finish_reason": "stop"}]
+        })
+
+@app.api_route("/{path_name:path}", methods=["GET", "POST"])
+async def catch_all(path_name: str):
+    return {"status": "ok", "path": path_name}
