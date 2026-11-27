@@ -29,6 +29,8 @@ def convert_pdf_base64_to_images(b64_str):
         return None
 
 @app.post("/v1/chat/completions")
+@app.post("/chat/completions")
+@app.post("/v1/v1/chat/completions")
 async def chat_completions(request: Request):
     data = await request.json()
     messages = data.get("messages", [])
@@ -36,6 +38,7 @@ async def chat_completions(request: Request):
     
     anthropic_messages = []
     system_prompt = ""
+    first_user_text = "새로운 대화"
     
     for msg in messages:
         role = msg.get("role")
@@ -48,11 +51,16 @@ async def chat_completions(request: Request):
         anthropic_content = []
         if isinstance(content, str):
             anthropic_content.append({"type": "text", "text": content})
+            if role == "user" and first_user_text == "새로운 대화":
+                first_user_text = content[:20]
         elif isinstance(content, list):
             for part in content:
                 p_type = part.get("type")
                 if p_type == "text":
-                    anthropic_content.append({"type": "text", "text": part.get("text", "")})
+                    t_val = part.get("text", "")
+                    anthropic_content.append({"type": "text", "text": t_val})
+                    if role == "user" and first_user_text == "새로운 대화":
+                        first_user_text = t_val[:20]
                 elif p_type in ["image_url", "image"]:
                     url = part.get("image_url", {}).get("url", "") or part.get("url", "")
                     if "base64," in url:
@@ -93,7 +101,7 @@ async def chat_completions(request: Request):
 
     created_time = int(time.time())
 
-    # 1. 스트리밍 모드 처리
+    # 1. 일반 대화 스트리밍 모드
     if stream:
         async def stream_generator():
             async with http_client.stream("POST", "https://api.anthropic.com/v1/messages", json=payload, headers=headers) as resp:
@@ -105,7 +113,6 @@ async def chat_completions(request: Request):
                     yield "data: [DONE]\n\n"
                     return
 
-                # 첫 번째 청크: role 전달
                 first_chunk = {"id": "chatcmpl-proxy", "object": "chat.completion.chunk", "created": created_time, "model": "claude-sonnet-5", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
                 yield f"data: {json.dumps(first_chunk)}\n\n"
 
@@ -128,7 +135,6 @@ async def chat_completions(request: Request):
                         except:
                             continue
                 
-                # 종료 청크
                 stop_chunk = {"id": "chatcmpl-proxy", "object": "chat.completion.chunk", "created": created_time, "model": "claude-sonnet-5", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                 yield f"data: {json.dumps(stop_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -141,27 +147,38 @@ async def chat_completions(request: Request):
         }
         return StreamingResponse(stream_generator(), headers=response_headers, media_type="text/event-stream")
 
-    # 2. 일반(Non-stream) 모드 처리
+    # 2. 🌟 대화방 제목 자동 생성 모드 (Non-stream / 초고속 안전 응답 보장)
     else:
-        resp = await http_client.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers)
-        res_data = resp.json()
         full_text = ""
-        for part in res_data.get("content", []):
-            if part.get("type") == "text":
-                full_text += part.get("text", "")
+        try:
+            resp = await http_client.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers)
+            if resp.status_code == 200:
+                res_data = resp.json()
+                for part in res_data.get("content", []):
+                    if part.get("type") == "text":
+                        full_text += part.get("text", "")
+        except Exception as e:
+            print(f"[Title Generation Warning] {e}")
+
+        # 혹시 클로드 지연 시 안전하게 첫 질문 바탕으로 즉시 제목 부여
+        if not full_text.strip():
+            full_text = first_user_text.replace("\n", " ").strip()[:20]
+
         return JSONResponse({
-            "id": "chatcmpl-proxy",
+            "id": "chatcmpl-title",
             "object": "chat.completion",
             "created": created_time,
             "model": "claude-sonnet-5",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": full_text}, "finish_reason": "stop"}]
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": full_text.strip().replace('"', '')
+                },
+                "finish_reason": "stop"
+            }]
         })
 
-@app.post("/v1/responses")
-@app.post("/responses")
-async def dummy_responses():
-    return {"status": "ok"}
-
-@app.get("/v1/models")
-async def get_models():
-    return {"data": [{"id": "claude-sonnet-5", "object": "model"}]}
+@app.api_route("/{path_name:path}", methods=["GET", "POST"])
+async def catch_all(path_name: str):
+    return {"status": "ok", "path": path_name}
